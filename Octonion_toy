@@ -1,0 +1,123 @@
+pip install numpy numba matplotlib   # (once, if you don’t already have them)
+python octonion_gravity_toy.py
+import numpy as np
+from numba import njit, prange
+import matplotlib.pyplot as plt
+
+# ==============================================================
+# Correct octonion algebra via Cayley–Dickson construction
+# (guarantees quaternion subalgebra is exactly associative)
+# ==============================================================
+
+@njit
+def quat_mul(a, b):
+    # a, b = [w, x, y, z]
+    w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3]
+    x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2]
+    y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1]
+    z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
+    return np.array([w, x, y, z])
+
+@njit
+def quat_conj(a):
+    return np.array([a[0], -a[1], -a[2], -a[3]])
+
+@njit
+def quat_sub(p, q):
+    return p - q
+
+@njit
+def quat_add(p, q):
+    return p + q
+
+@njit
+def oct_mult(a, b):
+    # a, b = [p0,p1,p2,p3, q0,q1,q2,q3]
+    p = a[:4]
+    q = a[4:]
+    r = b[:4]
+    s = b[4:]
+
+    pr = quat_mul(p, r)
+    term1 = quat_sub(pr, quat_mul(quat_conj(s), q))
+    term2 = quat_add(quat_mul(s, p), quat_mul(q, quat_conj(r)))
+
+    out = np.empty(8)
+    out[:4] = term1
+    out[4:] = term2
+    return out
+
+@njit
+def associator(a, b, c):
+    ab_c = oct_mult(oct_mult(a, b), c)
+    a_bc = oct_mult(a, oct_mult(b, c))
+    return ab_c - a_bc
+
+# ==============================================================
+# Fast gravity (associator) map with two triangles per cell
+# ==============================================================
+@njit(parallel=True)
+def compute_gravity_map(grid):
+    N = grid.shape[0]
+    gravity = np.zeros((N, N))
+
+    for i in prange(N):
+        for j in range(N):
+            A  = grid[i, j]
+            Br = grid[(i + 1) % N, j]
+            Cd = grid[i, (j + 1) % N]
+
+            Bl = grid[(i - 1) % N, j]
+            Cu = grid[i, (j - 1) % N]
+
+            # Two oriented triangles → reduces directional bias
+            assoc1 = associator(A, Br, Cd)
+            assoc2 = associator(A, Bl, Cu)
+
+            n1 = np.sum(assoc1 ** 2)
+            n2 = np.sum(assoc2 ** 2)
+
+            gravity[i, j] = np.sqrt(0.5 * (n1 + n2))
+    return gravity
+
+# ==============================================================
+# Gaussian blob utility
+# ==============================================================
+def add_gaussian_blob(grid, cx, cy, components, amp=12.0, sigma=7.0):
+    N = grid.shape[0]
+    i, j = np.ogrid[:N, :N]
+    dist2 = (i - cx)**2 + (j - cy)**2
+    factor = amp * np.exp(-dist2 / (2.0 * sigma**2))
+    grid[..., components] += factor[..., np.newaxis]
+
+# ==============================================================
+# Main
+# ==============================================================
+def main():
+    N = 200                     # feel free to go larger (512, 1024 still <0.2 s)
+    grid = np.zeros((N, N, 8), dtype=np.float64)
+
+    # Lepton: pure quaternionic (first quaternion p, q ≈ 0) → perfectly associative
+    add_gaussian_blob(grid, N//4, N//2, [0,1,2,3], amp=5.0, sigma=10.0)
+
+    # Quark: pure second quaternion q, p ≈ 0 → strongly non-associative → curvature
+    add_gaussian_blob(grid, 3*N//4, N//2, [4,5,6,7], amp=10.0, sigma=10.0)
+
+    print("Compiling Numba kernels...")
+    _ = compute_gravity_map(grid)           # first call compiles everything
+    print("Peak associator norm (curvature proxy):", gravity_map.max())
+
+    import time
+    t0 = time.time()
+    gravity_map = compute_gravity_map(grid)
+    print(f"Computation took {time.time() - t0:.3f} seconds")
+
+    plt.figure(figsize=(10, 6))
+    plt.imshow(gravity_map, cmap='inferno', origin='lower')
+    plt.colorbar(label='Curvature (associator strength)')
+    plt.title("Octonionic Toy Model\nLepton (left, flat, associative)  —  Quark (right, curved, non-associative)")
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
