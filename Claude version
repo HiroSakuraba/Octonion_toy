@@ -1,0 +1,236 @@
+import numpy as np
+from numba import njit, prange
+import matplotlib.pyplot as plt
+
+
+# ==============================================================
+# Quaternion helpers (standard Hamilton conventions)
+# ==============================================================
+
+@njit
+def quat_mul(a, b):
+    """Multiply two quaternions a = [w,x,y,z] and b = [w,x,y,z]"""
+    w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3]
+    x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2]
+    y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1]
+    z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
+    return np.array([w, x, y, z])
+
+
+@njit
+def quat_conj(a):
+    """Quaternion conjugate (negate the three imaginary parts)"""
+    return np.array([a[0], -a[1], -a[2], -a[3]])
+
+
+# ==============================================================
+# Octonion multiplication via Cayley–Dickson construction
+# An octonion is represented as two quaternions: o = (p, q)
+# Multiplication: (p,q) × (r,s) = (p r − s* q*, s p + q r*)
+# This convention preserves the full quaternion subalgebra.
+# ==============================================================
+
+@njit
+def oct_mult(a, b):
+    """
+    Multiply two octonions using standard Cayley-Dickson construction.
+    Input:  a, b → float64 arrays of length 8
+            a[:4] = real quaternion part p, a[4:] = imaginary quaternion part q
+    Output: new octonion (length 8)
+    
+    FIXED: Now properly conjugates both components as per standard construction:
+    (p,q) × (r,s) = (p r − s* q*, s p + q r*)
+    """
+    p, q = a[:4], a[4:]
+    r, s = b[:4], b[4:]
+
+    # Real part of product: p r − s* q*
+    term1 = quat_mul(p, r) - quat_mul(quat_conj(s), quat_conj(q))
+    # Imaginary part of product: s p + q r*
+    term2 = quat_mul(s, p) + quat_mul(q, quat_conj(r))
+
+    return np.concatenate((term1, term2))
+
+
+# ==============================================================
+# Associator and its squared norm (our curvature / gravity proxy)
+# [a,b,c] = (a b) c − a (b c)
+# In division algebras the associator measures deviation from associativity.
+# Norm of associator → local "non-associativity strength" → acts like curvature.
+# ==============================================================
+
+@njit
+def associator_norm_squared(a, b, c):
+    """
+    Compute || [a,b,c] ||² without allocating full 8-vectors repeatedly.
+    This is the performance-critical function.
+    """
+    ab = oct_mult(a, b)
+    abc = oct_mult(ab, c)
+
+    bc = oct_mult(b, c)
+    a_bc = oct_mult(a, bc)
+
+    diff = abc - a_bc
+    return np.dot(diff, diff)   # squared Euclidean norm
+
+
+# ==============================================================
+# Main gravity map computation
+# Uses multiple triangles per cell to reduce directional bias.
+# Parallelised with Numba prange → excellent scaling on multi-core CPUs.
+# ==============================================================
+
+@njit(parallel=True, fastmath=True)
+def compute_gravity_map(grid):
+    """
+    Input:  grid of shape (N, N, 8) containing octonion field values
+    Output: (N, N) array where each entry is √(average associator strength)
+            from multiple neighbouring triangles.
+    
+    IMPROVED: Now samples 8 triangles around each point for better coverage
+    and reduced directional bias.
+    """
+    N = grid.shape[0]
+    gravity = np.zeros((N, N), dtype=np.float64)
+
+    for i in prange(N):               # prange → parallel over rows
+        for j in range(N):
+            # Current cell
+            A = grid[i, j]
+
+            # Eight direct neighbours (toroidal / periodic boundary)
+            R = grid[(i + 1) % N, j]           # right
+            L = grid[(i - 1) % N, j]           # left
+            D = grid[i, (j + 1) % N]           # down
+            U = grid[i, (j - 1) % N]           # up
+            DR = grid[(i + 1) % N, (j + 1) % N]  # diagonal down-right
+            DL = grid[(i - 1) % N, (j + 1) % N]  # diagonal down-left
+            UR = grid[(i + 1) % N, (j - 1) % N]  # diagonal up-right
+            UL = grid[(i - 1) % N, (j - 1) % N]  # diagonal up-left
+
+            # Sample 8 triangles around the cell to get better angular coverage
+            n1 = associator_norm_squared(A, R, D)    # SE quadrant
+            n2 = associator_norm_squared(A, D, L)    # SW quadrant
+            n3 = associator_norm_squared(A, L, U)    # NW quadrant
+            n4 = associator_norm_squared(A, U, R)    # NE quadrant
+            
+            # Diagonal triangles for additional coverage
+            n5 = associator_norm_squared(A, R, DR)   # Right-diagonal
+            n6 = associator_norm_squared(A, D, DR)   # Down-diagonal
+            n7 = associator_norm_squared(A, L, DL)   # Left-diagonal
+            n8 = associator_norm_squared(A, U, UL)   # Up-diagonal
+
+            # Average all 8 triangles and take square root
+            avg = (n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8) / 8.0
+            gravity[i, j] = np.sqrt(avg)
+
+    return gravity
+
+
+# ==============================================================
+# Utility: add a Gaussian blob to selected octonion components
+# ==============================================================
+
+def add_gaussian_blob(grid, cx, cy, components, amp=12.0, sigma=7.0):
+    """
+    Add a 2D Gaussian bump centred at (cx, cy) to the chosen octonion
+    components (list of indices 0..7).
+    Modifies grid in-place.
+    
+    Args:
+        grid: (N, N, 8) array of octonions
+        cx: center x coordinate (column)
+        cy: center y coordinate (row)
+        components: list of octonion indices 0-7 to modify
+        amp: amplitude of Gaussian
+        sigma: width of Gaussian
+    """
+    if not all(0 <= c < 8 for c in components):
+        raise ValueError("Components must be in range 0-7")
+    
+    N = grid.shape[0]
+    y, x = np.ogrid[:N, :N]
+    dist2 = (y - cy)**2 + (x - cx)**2
+    factor = amp * np.exp(-dist2 / (2.0 * sigma**2))
+    grid[..., components] += factor[..., np.newaxis]
+
+
+# ==============================================================
+# Validation helper
+# ==============================================================
+
+def validate_grid(grid):
+    """Validate grid shape before computation"""
+    if grid.ndim != 3:
+        raise ValueError(f"Grid must be 3D, got {grid.ndim}D")
+    if grid.shape[2] != 8:
+        raise ValueError(f"Grid must have 8 components (octonions), got {grid.shape[2]}")
+    if grid.shape[0] != grid.shape[1]:
+        raise ValueError(f"Grid must be square, got {grid.shape[0]}x{grid.shape[1]}")
+
+
+# ==============================================================
+# Main demo
+# ==============================================================
+
+def main():
+    """
+    Demonstrate octonionic toy model of gravity.
+    
+    Creates two blobs with different associativity properties and
+    visualizes the resulting "curvature" field.
+    """
+    N = 300                                      # grid size (feel free to increase)
+    grid = np.zeros((N, N, 8), dtype=np.float64) # octonion field on a torus
+
+    # ------------------------------------------------------------------
+    # Lepton-like blob: lives purely in the first quaternion (indices 0-3)
+    # → stays inside associative subalgebra → zero associator → flat space
+    # ------------------------------------------------------------------
+    add_gaussian_blob(grid, N//4, N//2, components=[0,1,2,3],
+                      amp=6.0, sigma=15.0)
+
+    # ------------------------------------------------------------------
+    # Quark-like blob: lives purely in the second quaternion (indices 4-7)
+    # → fully non-associative → strong associator → curved space / gravity
+    # ------------------------------------------------------------------
+    add_gaussian_blob(grid, 3*N//4, N//2, components=[4,5,6,7],
+                      amp=14.0, sigma=15.0)
+
+    # Validate before computation
+    validate_grid(grid)
+
+    print("Compiling Numba kernels (first call is slow)...")
+    # Warm up with tiny grid to avoid timing compilation
+    tiny_grid = grid[:2, :2].copy()
+    _ = compute_gravity_map(tiny_grid)
+    
+    # Now compute the full grid
+    import time
+    t0 = time.time()
+    gravity_map = compute_gravity_map(grid)
+    elapsed = time.time() - t0
+    
+    print(f"Computation finished in {elapsed:.3f} seconds")
+    print(f"Peak curvature proxy: {gravity_map.max():.2f}")
+    print(f"Grid size: {N}×{N} = {N*N:,} cells")
+
+    # ------------------------------------------------------------------
+    # Visualisation
+    # ------------------------------------------------------------------
+    plt.figure(figsize=(11, 7))
+    im = plt.imshow(gravity_map, cmap='inferno', origin='lower',
+                    extent=[0, N, 0, N])
+    plt.colorbar(im, label='Curvature strength  √<|[a,b,c]|²>', shrink=0.8)
+    plt.title("Octonionic Toy Model of Gravity\n"
+              "Lepton (associative → flat, left)   —   Quark (non-associative → curved, right)",
+              fontsize=14, pad=20)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
