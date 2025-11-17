@@ -38,15 +38,16 @@ def oct_mult(a, b):
             a[:4] = real quaternion part p, a[4:] = imaginary quaternion part q
     Output: new octonion (length 8)
     
-    FIXED: Now properly conjugates both components as per standard construction:
-    (p,q) × (r,s) = (p r − s* q*, s p + q r*)
+    Standard construction that preserves quaternion subalgebra:
+    (p,q) × (r,s) = (p r − s̅ q, s p + q r̅)
+    Note: q is NEVER conjugated (this preserves the quaternion embedding)
     """
     p, q = a[:4], a[4:]
     r, s = b[:4], b[4:]
 
-    # Real part of product: p r − s* q*
-    term1 = quat_mul(p, r) - quat_mul(quat_conj(s), quat_conj(q))
-    # Imaginary part of product: s p + q r*
+    # Real part of product: p r − s̅ q
+    term1 = quat_mul(p, r) - quat_mul(quat_conj(s), q)
+    # Imaginary part of product: s p + q r̅
     term2 = quat_mul(s, p) + quat_mul(q, quat_conj(r))
 
     return np.concatenate((term1, term2))
