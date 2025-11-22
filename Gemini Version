@@ -1,0 +1,117 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+# --- 1. Vectorized Algebra Engine ---
+def oct_mult_vectorized(a, b):
+    """Vectorized Octonion Multiplication (Standard Cayley-Dickson)"""
+    a0, a1, a2, a3, a4, a5, a6, a7 = [a[..., i] for i in range(8)]
+    b0, b1, b2, b3, b4, b5, b6, b7 = [b[..., i] for i in range(8)]
+
+    c0 = a0*b0 - a1*b1 - a2*b2 - a3*b3 - a4*b4 - a5*b5 - a6*b6 - a7*b7
+    c1 = a0*b1 + a1*b0 + a2*b3 - a3*b2 + a4*b5 - a5*b4 - a6*b7 + a7*b6
+    c2 = a0*b2 - a1*b3 + a2*b0 + a3*b1 + a4*b6 + a5*b7 - a6*b4 - a7*b5
+    c3 = a0*b3 + a1*b2 - a2*b1 + a3*b0 + a4*b7 - a5*b6 + a6*b5 - a7*b4
+    c4 = a0*b4 - a1*b5 - a2*b6 - a3*b7 + a4*b0 + a5*b1 + a6*b2 + a7*b3
+    c5 = a0*b5 + a1*b4 - a2*b7 + a3*b6 - a4*b1 + a5*b0 - a6*b3 + a7*b2
+    c6 = a0*b6 + a1*b7 + a2*b4 - a3*b5 - a4*b2 + a5*b3 + a6*b0 - a7*b1
+    c7 = a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0
+
+    return np.stack([c0, c1, c2, c3, c4, c5, c6, c7], axis=-1)
+
+def get_associator_field(grid):
+    """Computes [A, B, C] magnitude for the whole grid"""
+    # Neighbors: Right (B) and Down (C)
+    B = np.roll(grid, shift=-1, axis=0)
+    C = np.roll(grid, shift=-1, axis=1)
+    
+    AB = oct_mult_vectorized(grid, B)
+    BC = oct_mult_vectorized(B, C)
+    
+    term1 = oct_mult_vectorized(AB, C) # (AB)C
+    term2 = oct_mult_vectorized(grid, BC) # A(BC)
+    
+    # Return scalar magnitude of the difference
+    return np.linalg.norm(term1 - term2, axis=-1)
+
+# --- 2. Simulation Setup ---
+
+N = 50
+# The Matter Field (Octonions)
+Psi = np.zeros((N, N, 8))
+# The Coordinate Grid (The Metric) - We track X and Y positions of every node
+X, Y = np.meshgrid(np.linspace(0, N, N), np.linspace(0, N, N))
+Grid_Pos = np.stack([X, Y], axis=-1)
+
+# Inject Blobs
+def add_blob(grid, cx, cy, indices, amp=8.0, sigma=5.0):
+    y, x = np.indices((N, N))
+    dist2 = (x - cx)**2 + (y - cy)**2
+    factor = amp * np.exp(-dist2 / (2 * sigma**2))
+    for idx in indices:
+        grid[..., idx] += factor
+
+# Lepton (Associative) - Left Side
+add_blob(Psi, cx=15, cy=25, indices=[1, 2, 3])
+# Quark (Non-Associative) - Right Side
+add_blob(Psi, cx=35, cy=25, indices=[4, 5, 6, 7])
+
+# --- 3. The Physics Loop ---
+
+steps = 30
+gravity_strength = 0.5  # How much the grid warps per step
+diffusion_rate = 0.05   # Matter spreading out
+
+# Store frames for plotting
+history = []
+
+print("Running Simulation...")
+for t in range(steps):
+    # 1. Calculate Tension (Stress-Energy)
+    tension = get_associator_field(Psi)
+    
+    # 2. Evolve Gravity (Update Coordinate Grid)
+    # The grid points should move TOWARDS high tension (attraction)
+    # We calculate the gradient of the tension field
+    grad_y, grad_x = np.gradient(tension)
+    
+    # Move grid points *in* towards the tension peak (Gradient Descent on distance)
+    # Note: This is a simplified 'elastic sheet' model of gravity
+    Grid_Pos[..., 0] -= grad_x * gravity_strength
+    Grid_Pos[..., 1] -= grad_y * gravity_strength
+    
+    # 3. Evolve Matter (Diffusion)
+    # Simple Laplacian smoothing to simulate quantum spreading
+    laplacian = (np.roll(Psi, 1, axis=0) + np.roll(Psi, -1, axis=0) +
+                 np.roll(Psi, 1, axis=1) + np.roll(Psi, -1, axis=1) - 4*Psi)
+    Psi += diffusion_rate * laplacian
+    
+    history.append(Grid_Pos.copy())
+
+# --- 4. Visualization (The Warped Grid) ---
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+def update(frame):
+    ax.clear()
+    # Plot the distorted grid lines
+    current_pos = history[frame]
+    X_distorted = current_pos[..., 0]
+    Y_distorted = current_pos[..., 1]
+    
+    # Draw grid lines
+    for i in range(0, N, 2):
+        ax.plot(X_distorted[i, :], Y_distorted[i, :], 'k-', alpha=0.3, lw=0.5) # Horizontal lines
+        ax.plot(X_distorted[:, i], Y_distorted[:, i], 'k-', alpha=0.3, lw=0.5) # Vertical lines
+        
+    ax.set_title(f"Time Step: {frame}\nLeft: Lepton (Flat) | Right: Quark (Gravity Well)")
+    ax.set_xlim(0, N)
+    ax.set_ylim(0, N)
+    
+    # Overlay the particle centers roughly
+    ax.text(15, 25, "Lepton", color="blue", ha="center", weight="bold")
+    ax.text(35, 25, "Quark", color="red", ha="center", weight="bold")
+
+ani = animation.FuncAnimation(fig, update, frames=len(history), interval=100)
+# To save: ani.save('gravity_warp.gif', writer='pillow')
+plt.show()
